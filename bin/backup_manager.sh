@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 
-# Exit immediately if a command exits with a non-zero status, treat unset variables as an error
 set -Eeuo pipefail
 
-# Configuration
-LOG_FILE="/home/kali/bash-backup-tool/logs/backup_tool.log"
-DEFAULT_DEST="/home/kali/bash-backup-tool/backups"
-RETENTION_DAYS=30
+# Determine configuration path (supports global install or local dev)
+if [[ -f "/opt/bash-backup-tool/config/settings.env" ]]; then
+    source "/opt/bash-backup-tool/config/settings.env"
+else
+    # Fallback to local development paths
+    CONFIG_PATH="$(dirname "$(readlink -f "$0")")/../config/settings.env"
+    if [[ -f "$CONFIG_PATH" ]]; then
+        source "$CONFIG_PATH"
+    else
+        echo "Error: Configuration file settings.env not found!" >&2
+        exit 1
+    fi
+fi
 
-# Remote & Webhook Configuration (Set your values here or via environment)
-ENABLE_REMOTE_SYNC="false"
-REMOTE_USER="remote_username"
-REMOTE_HOST="remote_server_ip_or_domain"
-REMOTE_DIR="/path/to/remote/backups"
-
-ENABLE_WEBHOOK="false"
-WEBHOOK_URL="https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+# Ensure log and backup directories exist
+mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$BACKUP_DEST"
 
 # Logging function
 log_message() {
@@ -26,51 +29,49 @@ log_message() {
     echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
 }
 
-# Function to check dependencies
+# Dependency health check
 check_dependencies() {
     for cmd in tar gzip gpg curl rsync; do
         if ! command -v "$cmd" &> /dev/null; then
-            echo "Warning: Optional/Required tool '$cmd' is not installed." >&2
+            echo "Warning: Required tool '$cmd' is missing." >&2
         fi
     done
 }
 
-# Send Webhook Notification function
+# Webhook notification
 send_webhook() {
     local status="$1"
     local message="$2"
 
-    if [[ "$ENABLE_WEBHOOK" != "true" || -z "$WEBHOOK_URL" ]]; then
+    if [[ "${ENABLE_WEBHOOK:-false}" != "true" || -z "${WEBHOOK_URL:-}" ]]; then
         return
     fi
 
     local payload
-    payload=$(jq -n \
-                  --arg content "🔔 **Backup Tool Alert** [$status]: $message" \
-                  '{content: $content}' 2>/dev/null || echo "{\"content\": \"Backup Tool Alert [$status]: $message\"}")
+    payload=$(jq -n --arg content "🔔 **Backup Tool Alert** [$status]: $message" '{content: $content}' 2>/dev/null || echo "{\"content\": \"Backup Tool Alert [$status]: $message\"}")
 
     curl -s -H "Content-Type: application/json" -X POST -d "$payload" "$WEBHOOK_URL" &>/dev/null || true
 }
 
-# Remote Sync function via rsync/SFTP
+# Remote synchronization
 push_to_remote() {
     local file_path="$1"
 
-    if [[ "$ENABLE_REMOTE_SYNC" != "true" ]]; then
+    if [[ "${ENABLE_REMOTE_SYNC:-false}" != "true" ]]; then
         return
     fi
 
     log_message "INFO" "Syncing '$file_path' to remote server $REMOTE_HOST:$REMOTE_DIR..."
     if rsync -avz -e "ssh" "$file_path" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR"; then
         log_message "SUCCESS" "Successfully synced backup to remote server."
-        send_webhook "SUCCESS" "Backup created and synced successfully to remote server!"
+        send_webhook "SUCCESS" "Backup synced successfully to remote server!"
     else
         log_message "ERROR" "Failed to sync backup to remote server."
-        send_webhook "ERROR" "Local backup succeeded, but remote sync failed for $file_path."
+        send_webhook "ERROR" "Local backup succeeded, but remote sync failed."
     fi
 }
 
-# Backup function
+# Backup function with disk space health check
 perform_backup() {
     echo ""
     read -rp "Enter the absolute path of the directory to backup: " src_dir
@@ -78,18 +79,24 @@ perform_backup() {
     if [[ ! -d "$src_dir" ]]; then
         log_message "ERROR" "Source directory does not exist: $src_dir"
         echo "Directory not found."
-        send_webhook "ERROR" "Backup failed: Source directory $src_dir not found."
         return
     fi
 
-    read -rp "Enter destination directory for backup [Default: $DEFAULT_DEST]: " dest_dir
-    dest_dir="${dest_dir:-$DEFAULT_DEST}"
-    mkdir -p "$dest_dir"
+    mkdir -p "$BACKUP_DEST"
+
+    # Pre-flight check: Verify destination disk space (ensure at least 100MB free)
+    local available_space
+    available_space=$(df -k "$BACKUP_DEST" | awk 'NR==2 {print $4}')
+    if [[ "$available_space" -lt 102400 ]]; then
+        log_message "ERROR" "Insufficient disk space on destination partition."
+        echo "Error: Insufficient disk space in $BACKUP_DEST."
+        return
+    fi
 
     local timestamp
     timestamp=$(date +"%Y%m%d_%H%M%S")
     local archive_name="backup_$(basename "$src_dir")_$timestamp.tar.gz"
-    local archive_path="$dest_dir/$archive_name"
+    local archive_path="$BACKUP_DEST/$archive_name"
 
     log_message "INFO" "Starting backup of '$src_dir' to '$archive_path'..."
     
@@ -98,12 +105,12 @@ perform_backup() {
         
         local final_backup_path="$archive_path"
 
-        # Optional Encryption
+        # Optional GPG Encryption
         read -rp "Do you want to encrypt this backup with GPG? (y/n): " encrypt_choice
         if [[ "$encrypt_choice" =~ ^[Yy]$ ]]; then
             read -rp "Enter GPG Recipient/Email: " gpg_recipient
             if gpg --encrypt --recipient "$gpg_recipient" "$archive_path"; then
-                rm -f "$archive_path" # Remove unencrypted archive
+                rm -f "$archive_path"
                 final_backup_path="$archive_path.gpg"
                 log_message "SUCCESS" "Backup encrypted successfully: $final_backup_path"
                 echo "Backup completed and encrypted: $final_backup_path"
@@ -115,13 +122,11 @@ perform_backup() {
             echo "Backup completed successfully: $archive_path"
         fi
 
-        # Trigger remote sync & webhooks
         push_to_remote "$final_backup_path"
         send_webhook "SUCCESS" "Backup completed successfully for $src_dir"
-
     else
         log_message "ERROR" "Failed to create archive for '$src_dir'."
-        echo "Backup failed. Check logs for details."
+        echo "Backup failed. Check logs."
         send_webhook "ERROR" "Failed to create archive for $src_dir"
     fi
 }
@@ -142,7 +147,6 @@ perform_restore() {
 
     local file_to_extract="$archive_path"
 
-    # Handle decryption if it's a GPG file
     if [[ "$archive_path" == *.gpg ]]; then
         echo "Encrypted archive detected. Decrypting..."
         local decrypted_path="${archive_path%.gpg}"
@@ -170,35 +174,24 @@ perform_restore() {
     fi
 }
 
-# Cleanup Old Backups function
+# Cleanup Old Backups
 cleanup_backups() {
     echo ""
-    read -rp "Enter backup directory to clean [Default: $DEFAULT_DEST]: " target_dir
-    target_dir="${target_dir:-$DEFAULT_DEST}"
-
-    if [[ ! -d "$target_dir" ]]; then
-        echo "Directory not found: $target_dir"
-        return
-    fi
-
-    read -rp "Delete backups older than how many days? [Default: $RETENTION_DAYS]: " days
-    days="${days:-$RETENTION_DAYS}"
-
-    log_message "INFO" "Scanning '$target_dir' for backups older than $days days..."
+    log_message "INFO" "Scanning '$BACKUP_DEST' for backups older than ${RETENTION_DAYS} days..."
     
     local deleted_files
-    deleted_files=$(find "$target_dir" -type f \( -name "backup_*.tar.gz" -o -name "backup_*.tar.gz.gpg" \) -mtime +"$days" -print -delete)
+    deleted_files=$(find "$BACKUP_DEST" -type f \( -name "backup_*.tar.gz" -o -name "backup_*.tar.gz.gpg" \) -mtime +"$RETENTION_DAYS" -print -delete)
 
     if [[ -n "$deleted_files" ]]; then
         log_message "SUCCESS" "Cleaned up old backups successfully:\n$deleted_files"
         echo "Old backups cleaned up successfully!"
     else
-        log_message "INFO" "No backups older than $days days found."
+        log_message "INFO" "No backups older than $RETENTION_DAYS days found."
         echo "No matching old backups found to delete."
     fi
 }
 
-# Main Menu Loop
+# Main Menu
 main() {
     check_dependencies
     while true; do
@@ -222,7 +215,7 @@ main() {
                if [[ -f "$LOG_FILE" ]]; then
                    cat "$LOG_FILE"
                else
-                  echo "No logs found yet."
+                   echo "No logs found yet."
                fi
                ;;
             5) echo "Exiting. Goodbye!"; exit 0 ;;
