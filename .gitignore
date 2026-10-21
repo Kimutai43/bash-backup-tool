@@ -1,0 +1,6 @@
+# Ignore local backups and logs
+backups/
+logs/
+*.tar.gz
+*.gpg
+.DS_Store
